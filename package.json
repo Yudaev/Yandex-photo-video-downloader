@@ -1,0 +1,34 @@
+{
+  "name": "yandex-photo-video-downloader",
+  "description": "Chrome extension for downloading photos and videos from Yandex unlimited storage.",
+  "version": "0.1.14",
+  "private": true,
+  "type": "module",
+  "license": "MIT",
+  "engines": {
+    "node": ">=22.12.0"
+  },
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip",
+    "typecheck": "tsc --noEmit",
+    "check": "npm run typecheck && npm test",
+    "postinstall": "wxt prepare",
+    "test": "npm run build && node tests/extension.test.mjs"
+  },
+  "dependencies": {
+    "react": "^19.3.0",
+    "react-dom": "^19.3.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.3.0",
+    "@types/react-dom": "^19.3.0",
+    "@wxt-dev/module-react": "^1.2.2",
+    "fake-indexeddb": "^6.2.5",
+    "linkedom": "^0.18.13",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.4",
+    "wxt": "^0.21.4"
+  }
+}

@@ -1,0 +1,12 @@
+node_modules/
+.output/
+.wxt/
+coverage/
+.idea/
+.env
+.env.*
+!.env.example
+*.log
+.playwright-cli/
+.playwright-mcp/
+output/playwright/

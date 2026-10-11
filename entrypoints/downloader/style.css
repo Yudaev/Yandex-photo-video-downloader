@@ -1,0 +1,24 @@
+:root {
+  font-family: system-ui, sans-serif;
+  color-scheme: light dark;
+  line-height: 1.6;
+}
+
+body {
+  margin: 0;
+}
+
+main {
+  max-width: 48rem;
+  margin: 4rem auto;
+  padding: 0 1.5rem;
+}
+
+h1 {
+  line-height: 1.2;
+  overflow-wrap: anywhere;
+}
+
+a {
+  color: light-dark(#174ea6, #8ab4f8);
+}
