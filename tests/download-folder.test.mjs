@@ -7,7 +7,19 @@ import { indexedDB } from 'fake-indexeddb';
 globalThis.indexedDB = indexedDB;
 const source = readFileSync(new URL('../lib/download-folder.ts', import.meta.url), 'utf8');
 const { code } = await transformWithOxc(source, 'download-folder.ts');
-const { getDownloadFolder, setDownloadFolder, getDownloadResult, setDownloadResult, getUnfinishedDownloads } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+const { getDownloadFolder, setDownloadFolder, getDownloadResult, setDownloadResult, getUnfinishedDownloads, matchesDownloadStatus } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+
+test('download modes select only previous errors or files without any status', () => {
+  for (const [status, retry, fresh] of [
+    [undefined, false, true],
+    ['error', true, false],
+    ['success', false, false],
+    ['saving', false, false],
+  ]) {
+    assert.equal(matchesDownloadStatus(status, 'error'), retry, `retry: ${status}`);
+    assert.equal(matchesDownloadStatus(status, 'new'), fresh, `new: ${status}`);
+  }
+});
 
 test('persists the selected directory reference across database connections and replaces it', async () => {
   assert.equal(await getDownloadFolder(), undefined);

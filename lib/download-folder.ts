@@ -65,6 +65,10 @@ export interface DownloadResult extends DownloadItem {
   modifiedAt?: string;
 }
 
+export function matchesDownloadStatus(status: DownloadResult['status'] | undefined, mode: 'error' | 'new'): boolean {
+  return mode === 'error' ? status === 'error' : status === undefined;
+}
+
 export function getDownloadResult(key: string): Promise<DownloadResult | undefined> {
   return accessStore('downloads', 'readonly', (store) => store.get(key));
 }

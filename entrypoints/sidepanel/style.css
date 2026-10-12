@@ -13,5 +13,6 @@ button:focus-visible { outline:2px solid #eac5ff; outline-offset:3px; }
 .hint { color:#c6bddb; font-size:12px; }
 fieldset { margin-top:20px; border:1px solid #65508b; border-radius:8px; }
 .progress { overflow-wrap:anywhere; }
+.download-actions { display:flex; flex-direction:column; align-items:stretch; }
 
 pre { padding:12px; border:1px solid #65508b; border-radius:8px; white-space:pre-wrap; overflow-wrap:anywhere; user-select:text; }

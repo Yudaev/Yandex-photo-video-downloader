@@ -1,7 +1,7 @@
 {
   "name": "yandex-photo-video-downloader",
   "description": "Chrome extension for downloading photos and videos from Yandex unlimited storage.",
-  "version": "0.1.14",
+  "version": "0.1.15",
   "private": true,
   "type": "module",
   "license": "MIT",

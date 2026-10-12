@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from 'react';
 import { createRoot } from 'react-dom/client';
 import { browser } from 'wxt/browser';
-import { getDownloadFolder, setDownloadFolder, getDownloadResult, setDownloadResult, getUnfinishedDownloads, getSuccessfulDownloads, type DownloadItem, type DownloadResult } from '../../lib/download-folder';
+import { getDownloadFolder, setDownloadFolder, getDownloadResult, setDownloadResult, getUnfinishedDownloads, getSuccessfulDownloads, matchesDownloadStatus, type DownloadItem, type DownloadResult } from '../../lib/download-folder';
 import { captureDownloadUrl } from '../../lib/capture-download';
 import { canReuseDownload, saveDownload } from '../../lib/save-download';
 import { prepareDownloadMetadata, dateInstructions } from '../../lib/download-metadata';
@@ -82,7 +82,7 @@ function FolderPicker() {
     } catch (error) { setLogStatus(`Не удалось сохранить журнал: ${diagnosticError(error)}`); }
   }
 
-  async function startDownload() {
+  async function startDownload(mode: 'error' | 'new') {
     if (!folder || starting.current || (!photos && !videos)) return;
     starting.current = true;
     setRunning(true);
@@ -164,6 +164,11 @@ function FolderPicker() {
             setProgress(item.name);
             if ((item.type === 'photo' && photos) || (item.type === 'video' && videos)) {
               let previous = await getDownloadResult(item.key);
+              if (!matchesDownloadStatus(previous?.status ?? metadata.find(item.key)?.status, mode)) {
+                await phase('traversal-next');
+                item = await next('next');
+                continue;
+              }
               let recoveredFromJson = false;
               let alreadySaved = await canReuseDownload(folder, { ...previous, ...item, id: item.id || previous?.id || '', created: item.created ?? previous?.created, modified: item.modified ?? previous?.modified }, previous);
               if (!alreadySaved) {
@@ -241,7 +246,7 @@ function FolderPicker() {
             await phase('traversal-next');
             item = await next('next');
           }
-          setStatus(totals.failed ? 'Фотолента обработана. Неудачные файлы отмечены крестиком; повторный запуск попробует их снова.' : 'Фотолента обработана. Файлы сохранены.');
+          setStatus(totals.failed ? 'Фотолента обработана. Неудачные файлы отмечены крестиком; нажмите «Повторить файлы с ошибкой».' : 'Фотолента обработана. Загрузка выбранных файлов завершена.');
         } finally {
           if (tabId !== undefined) await browser.tabs.sendMessage(tabId, { type: 'photo-traversal', action: 'stop' }).catch(() => {});
         }
@@ -302,9 +307,12 @@ function FolderPicker() {
       <p>Сохранено: {counts.saved}. Ошибок: {counts.failed}. Уже в папке: {counts.skipped}.</p>
       <p className="progress" aria-live="polite">{progress}</p>
       {running ? <button type="button" onClick={stopDownload}>Остановить скачивание</button>
-        : <button type="button" disabled={!folder || busy || loading || (!photos && !videos)} onClick={startDownload}>Начать / продолжить скачивание</button>}
-      <p className="hint">Во время скачивания оставьте вкладку и панель открытыми. Закрытие панели останавливает загрузку. Повторный запуск пропускает проверенные файлы в выбранной папке. Существующие файлы не перезаписываются.</p>
-      <p className="hint">Уже сохранённые файлы проверяются по папке, имени, размеру и датам. При остановке или сбое нажмите «Начать / продолжить скачивание»: проверенные файлы не загружаются заново, неудачные повторяются.</p>
+        : <div className="download-actions">
+          <button type="button" disabled={!folder || busy || loading || (!photos && !videos)} onClick={() => startDownload('error')}>Повторить файлы с ошибкой</button>
+          <button type="button" disabled={!folder || busy || loading || (!photos && !videos)} onClick={() => startDownload('new')}>Скачать файлы без статуса</button>
+        </div>}
+      <p className="hint">Во время скачивания оставьте вкладку и панель открытыми. Закрытие панели останавливает загрузку. Существующие файлы не перезаписываются.</p>
+      <p className="hint">«Повторить файлы с ошибкой» скачивает только файлы с крестиком. «Скачать файлы без статуса» скачивает только файлы без результата в истории или JSON. Успешные файлы пропускаются в обоих режимах, даже при смене папки. Прерванные загрузки после открытия панели считаются ошибками.</p>
       <p className="hint">Имя и даты Яндекса сохраняются в истории и в yandex-downloads.json рядом с файлами. Время Яндекса трактуется в часовом поясе браузера; JSON также хранит даты в UTC.</p>
       <section aria-label="Диагностика">
         <h2>Диагностика</h2>
