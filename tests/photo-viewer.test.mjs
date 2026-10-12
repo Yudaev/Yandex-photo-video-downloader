@@ -81,7 +81,7 @@ function traversalPage() {
   let top = 0; let appended = false;
   Object.defineProperties(doc.documentElement, {
     scrollHeight: { get: () => 800 }, clientHeight: { get: () => 500 },
-    scrollTop: { get: () => top, set: value => {
+    scrollTop: { configurable: true, get: () => top, set: value => {
       top = Math.min(value, 300);
       if (top > 0 && !appended) { appended = true; setTimeout(() => addTile('late.MOV', 'video'), 1); }
     } },
@@ -102,6 +102,98 @@ test('traverses delayed virtual-grid items exactly once and finishes only at a s
   assert.deepEqual(opened, ['first.HEIC', 'late.MOV']);
   traversal.stop();
   await assert.rejects(traversal.next(), /остановлено/);
+});
+
+test('recovers an empty visible grid after scrolling without returning visited files again', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  const scroll = doc.documentElement;
+  const position = Object.getOwnPropertyDescriptor(scroll, 'scrollTop');
+  const first = doc.querySelector('.photo__item');
+  let blank = false; let failedOnce = false; let top = 0;
+  first.getBoundingClientRect = () => blank ? { top: -300, bottom: -200 } : { top: 10, bottom: 110 };
+  Object.defineProperty(scroll, 'scrollTop', {
+    get: () => top,
+    set(value) {
+      top = Math.min(value, 300);
+      if (value > 0 && !failedOnce) { failedOnce = true; blank = true; return; }
+      if (value === 0) blank = false;
+      position.set(value);
+    },
+  });
+  assert.equal((await traversal.start()).name, 'first.HEIC');
+  assert.equal((await traversal.next()).name, 'late.MOV');
+  assert.equal(await traversal.next(), null);
+  assert.equal(traversal.diagnose().scrollRecoveries, 1);
+  traversal.stop();
+});
+
+test('a permanently empty visible grid stops after bounded recovery attempts', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  await traversal.start();
+  doc.querySelector('.photo__item').getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  await assert.rejects(traversal.next(), /Фотолента не загрузилась/);
+  assert.equal(traversal.diagnose().scrollRecoveries, 2);
+  assert.equal(traversal.diagnose().visited, 1);
+  traversal.stop();
+});
+
+test('falls back to the top when restoring the last visible position does not repair the grid', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  assert.equal((await traversal.start()).name, 'first.HEIC');
+  assert.equal((await traversal.next()).name, 'late.MOV');
+  const scroll = doc.documentElement;
+  const position = Object.getOwnPropertyDescriptor(scroll, 'scrollTop');
+  for (const tile of doc.querySelectorAll('.photo__item')) tile.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  let returnsToTop = 0;
+  Object.defineProperty(scroll, 'scrollTop', {
+    get: position.get,
+    set(value) {
+      position.set(value);
+      if (value === 0 && ++returnsToTop === 2) {
+        const tile = doc.querySelector('.photo__item').cloneNode(true);
+        tile.title = 'recovered.HEIC';
+        tile.getBoundingClientRect = () => ({ top: 10, bottom: 110 });
+        doc.getElementById('tiles').append(tile);
+      }
+    },
+  });
+  assert.equal((await traversal.next()).name, 'recovered.HEIC');
+  assert.equal(traversal.diagnose().visited, 3);
+  assert.equal(traversal.diagnose().scrollRecoveries, 2);
+  assert.equal(await traversal.next(), null);
+  traversal.stop();
+});
+
+test('an account change with no visible tiles halts without recovery', async () => {
+  const { traversal, doc } = traversalPage();
+  await traversal.start();
+  const tile = doc.querySelector('.photo__item');
+  tile.querySelector('img').src = '//downloader.disk.yandex.ru/preview/hash/inf/token?uid=43';
+  tile.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  await assert.rejects(traversal.next(), /Аккаунт Яндекса изменился/);
+  assert.equal(traversal.diagnose().scrollRecoveries, 0);
+  traversal.stop();
+});
+
+test('stopping while waiting for an empty grid prevents recovery scrolling', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  await traversal.start();
+  doc.querySelector('.photo__item').getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; traversal.stop(); callback(); }, 0);
+  await assert.rejects(traversal.next(), /остановлено/);
+  assert.equal(traversal.diagnose().scrollRecoveries, 0);
+  assert.equal(doc.documentElement.scrollTop, 0);
 });
 
 test('filters excluded types without opening them', async () => {
