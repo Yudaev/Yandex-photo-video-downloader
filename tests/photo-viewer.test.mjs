@@ -130,16 +130,71 @@ test('recovers an empty visible grid after scrolling without returning visited f
   traversal.stop();
 });
 
-test('a permanently empty visible grid stops after bounded recovery attempts', async ({ mock }) => {
+test('waits through repeated empty-grid timeouts and continues when the feed returns', async ({ mock }) => {
   let time = 0; mock.method(Date, 'now', () => time);
   const { traversal, doc, win } = traversalPage();
   const timer = win.setTimeout;
-  win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
   await traversal.start();
-  doc.querySelector('.photo__item').getBoundingClientRect = () => ({ top: -300, bottom: -200 });
-  await assert.rejects(traversal.next(), /Фотолента не загрузилась/);
-  assert.equal(traversal.diagnose().scrollRecoveries, 2);
-  assert.equal(traversal.diagnose().visited, 1);
+  const first = doc.querySelector('.photo__item');
+  first.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  let showedWaiting = false;
+  win.setTimeout = (callback, ms) => timer(() => {
+    time += ms;
+    showedWaiting ||= traversal.diagnose().waitingForPhotos === true;
+    for (const tile of doc.querySelectorAll('.photo__item')) {
+      tile.getBoundingClientRect = () => time > 125_000 ? { top: 10, bottom: 110 } : { top: -300, bottom: -200 };
+    }
+    callback();
+  }, 0);
+  assert.equal((await traversal.next()).name, 'late.MOV');
+  assert.ok(traversal.diagnose().scrollRecoveries >= 4);
+  assert.equal(showedWaiting, true);
+  assert.equal(traversal.diagnose().waitingForPhotos, false);
+  assert.equal(traversal.diagnose().visited, 2);
+  traversal.stop();
+});
+
+test('an initially empty feed waits beyond 30 seconds and can be stopped', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  doc.getElementById('tiles').replaceChildren();
+  win.setTimeout = (callback, ms) => timer(() => {
+    time += ms;
+    doc.getElementById('tiles').replaceChildren();
+    if (time > 95_000) traversal.stop();
+    callback();
+  }, 0);
+  await assert.rejects(traversal.start(), /остановлено/);
+  assert.ok(time > 95_000);
+  assert.equal(traversal.diagnose().waitingForPhotos, false);
+});
+
+test('recovery at the top changes scroll position to wake the virtual grid', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, doc, win } = traversalPage();
+  const timer = win.setTimeout;
+  await traversal.start();
+  const first = doc.querySelector('.photo__item');
+  first.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  const scroll = doc.documentElement;
+  const position = Object.getOwnPropertyDescriptor(scroll, 'scrollTop');
+  let moved = false;
+  Object.defineProperty(scroll, 'scrollTop', {
+    get: position.get,
+    set(value) {
+      position.set(value);
+      if (value > 0) { moved = true; first.getBoundingClientRect = () => ({ top: 10, bottom: 110 }); }
+    },
+  });
+  win.setTimeout = (callback, ms) => timer(() => {
+    time += ms;
+    if (time > 125_000) traversal.stop();
+    callback();
+  }, 0);
+  assert.equal((await traversal.next()).name, 'late.MOV');
+  assert.equal(moved, true);
+  assert.equal(traversal.diagnose().scrollRecoveries, 1);
   traversal.stop();
 });
 
@@ -234,6 +289,14 @@ test('already saved candidates can be skipped without opening any viewer', async
   traversal.stop();
 });
 
+test('resuming after reload skips previously attempted files and retains the original account', async () => {
+  const { traversal } = traversalPage();
+  assert.equal((await traversal.start({ photos: true, videos: true, account: '42', visited: [JSON.stringify(['42', '/photounlim/first.HEIC'])] })).name, 'late.MOV');
+  assert.equal(await traversal.next(), null);
+  traversal.stop();
+  await assert.rejects(traversal.start({ photos: true, videos: true, account: '43', visited: [] }), /Аккаунт Яндекса изменился/);
+});
+
 test('refuses to open a different candidate than the one being checked', async () => {
   const { traversal, opened } = traversalPage();
   await traversal.start();
@@ -247,6 +310,7 @@ test('diagnostics retain traversal and viewport state without preview URLs', asy
   await traversal.start();
   const state = traversal.diagnose();
   assert.equal(state.visited, 1);
+  assert.equal(state.account, '42');
   assert.equal(state.identified, 1);
   assert.equal(state.visible, 1);
   assert.equal(state.viewerOpen, false);

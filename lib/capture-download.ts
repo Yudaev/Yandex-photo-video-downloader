@@ -1,10 +1,11 @@
 // Serialized into MAIN world: keep this function independent of module imports.
-export function captureDownloadUrl(expectedId: string, expectedName: string): Promise<{ url?: string; error?: string; trace?: unknown[]; source?: 'api'; alternateUrl?: string }> {
+export function captureDownloadUrl(expectedId: string, expectedName: string): Promise<{ url?: string; error?: string; reloadRequired?: boolean; trace?: unknown[]; source?: 'api'; alternateUrl?: string }> {
   const trace: unknown[] = [];
   let usedApi = false;
   let selectedUrl: string | undefined;
   const apiLinks = new Map<string, URL>();
   let restoreNetwork = () => {};
+  let reloadRequired = false;
   return new Promise<string>((resolve, reject) => {
     const prototype = HTMLIFrameElement.prototype;
     const button = document.querySelector<HTMLButtonElement>('.slider button[aria-label="Скачать"]');
@@ -39,6 +40,7 @@ export function captureDownloadUrl(expectedId: string, expectedName: string): Pr
       return;
     }
     if (document.documentElement.hasAttribute('data-ypvd-download-pending')) {
+      reloadRequired = true;
       reject(new Error('Предыдущий запрос Яндекса ещё не завершён. Обновите страницу перед повторным запуском.'));
       return;
     }
@@ -157,6 +159,7 @@ export function captureDownloadUrl(expectedId: string, expectedName: string): Pr
     const timer = setTimeout(() => {
       if (apiUrl) { useApi(); return; }
       cancelled = true;
+      reloadRequired = true;
       clearTimeout(apiTimer);
       restoreNetwork();
       reject(new Error('Яндекс не выдал адрес оригинала за 30 секунд. Обновите страницу перед повторным запуском.'));
@@ -192,5 +195,5 @@ export function captureDownloadUrl(expectedId: string, expectedName: string): Pr
     const digest = apiLinks.get('digest');
     trace.push({ event: 'selected-link', source: usedApi ? 'api' : 'browser', field, apiObserved: apiLinks.size > 0 });
     return { url, ...(digest && digest.href !== url ? { alternateUrl: digest.href } : {}), ...(usedApi ? { source: 'api' as const } : {}), trace };
-  }, error => ({ error: error instanceof Error ? error.message : 'Ошибка кнопки скачивания.', ...(trace.length ? { trace } : {}) }));
+  }, error => ({ error: error instanceof Error ? error.message : 'Ошибка кнопки скачивания.', ...(reloadRequired ? { reloadRequired: true } : {}), ...(trace.length ? { trace } : {}) }));
 }

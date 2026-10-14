@@ -58,6 +58,7 @@ export function createPhotoTraversal(doc: Document, win: Window) {
   let scroll: HTMLElement;
   let lastVisibleTop = 0;
   let scrollRecoveries = 0;
+  let waitingForPhotos = false;
   let selected: ReturnType<typeof readPhotoTiles>[number] | undefined;
   const delay = (ms: number) => new Promise<void>((resolve) => win.setTimeout(resolve, ms));
   const ensurePage = () => {
@@ -86,33 +87,38 @@ export function createPhotoTraversal(doc: Document, win: Window) {
     let bottom = 0;
     let previousHeight = 0;
     let recoveryAttempts = 0;
+    const emptyFeedMessage = 'Фотолента не загрузилась или в окне нет её элементов.';
     while (true) {
       let tiles: ReturnType<typeof readPhotoTiles>;
       try {
         tiles = await waitFor(() => {
           const items = readPhotoTiles(doc);
-          if (!items.length) return undefined;
-          if (items[0]!.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
-          if (!items.some(item => {
+          if (!items.length) { waitingForPhotos = true; return undefined; }
+          if (account && items[0]!.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
+          account = items[0]!.account;
+          waitingForPhotos = !items.some(item => {
             const rect = item.element.getBoundingClientRect();
             return rect.bottom > 0 && rect.top < win.innerHeight;
-          })) return undefined;
+          });
+          if (waitingForPhotos) return undefined;
           return items;
-        }, 'Фотолента не загрузилась или в окне нет её элементов.');
+        }, emptyFeedMessage);
       } catch (error) {
         ensurePage();
-        const current = readPhotoTiles(doc);
-        if (current.length && current[0]!.account !== account) throw error;
-        if (recoveryAttempts >= 2) throw error;
+        if (!(error instanceof Error) || error.message !== emptyFeedMessage) throw error;
         recoveryAttempts++;
         scrollRecoveries++;
         bottom = 0; previousHeight = 0;
         scroll = (doc.scrollingElement ?? doc.documentElement) as HTMLElement;
         // A virtual grid can keep stale tiles outside the viewport; force a new scroll position.
-        scroll.scrollTop = recoveryAttempts === 1 ? Math.max(0, lastVisibleTop - scroll.clientHeight) : 0;
+        const restorePosition = recoveryAttempts % 2 === 1;
+        const nudgeFromTop = Math.min(100, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+        scroll.scrollTop = restorePosition
+          ? lastVisibleTop > 0 ? Math.max(0, lastVisibleTop - scroll.clientHeight) : nudgeFromTop
+          : 0;
         await delay(500);
         ensurePage();
-        if (recoveryAttempts === 1) {
+        if (restorePosition) {
           scroll.scrollTop = lastVisibleTop;
           await delay(500);
         }
@@ -185,32 +191,28 @@ export function createPhotoTraversal(doc: Document, win: Window) {
   }
 
   return {
-    async start(options: { photos: boolean; videos: boolean } = { photos: true, videos: true }) {
+    async start(options: { photos: boolean; videos: boolean; account?: string; visited?: string[] } = { photos: true, videos: true }) {
       if (!stopped) throw new Error('В этой вкладке уже идёт скачивание.');
       stopped = false;
-      visited = new Set();
+      visited = new Set(options.visited ?? []);
+      account = options.account ?? '';
       unresolved.clear();
       lastVisibleTop = 0;
       scrollRecoveries = 0;
+      waitingForPhotos = false;
       photos = options.photos;
       videos = options.videos;
       try {
         await close();
         scroll = (doc.scrollingElement ?? doc.documentElement) as HTMLElement;
         scroll.scrollTop = 0;
-        await waitFor(() => {
-          const tiles = readPhotoTiles(doc);
-          if (!tiles.length || !tiles.some(item => item.element.getBoundingClientRect().top < win.innerHeight)) return undefined;
-          return true;
-        }, 'Фотолента не загрузилась.');
-        account = readPhotoTiles(doc)[0]!.account;
         return await next();
-      } catch (error) { stopped = true; throw error; }
+      } catch (error) { stopped = true; waitingForPhotos = false; throw error; }
     },
     next,
     diagnose() {
       const tiles = readPhotoTiles(doc);
-      return { time: new Date().toISOString(), route: win.location.pathname, stopped, visited: visited.size, scrollRecoveries,
+      return { time: new Date().toISOString(), route: win.location.pathname, account, stopped, visited: visited.size, scrollRecoveries, waitingForPhotos,
         rendered: doc.querySelectorAll('.photo__item[title]').length, identified: tiles.filter(tile => tile.key).length,
         visible: tiles.filter(tile => { const rect = tile.element.getBoundingClientRect(); return rect.bottom > 0 && rect.top < win.innerHeight; }).length,
         unresolved: [...unresolved.values()].slice(0, 50), unresolvedCount: unresolved.size,
@@ -222,6 +224,7 @@ export function createPhotoTraversal(doc: Document, win: Window) {
     stop() {
       if (stopped) return;
       stopped = true;
+      waitingForPhotos = false;
       doc.dispatchEvent(new (doc.defaultView?.Event ?? Event)('ypvd-stop'));
       doc.querySelector<HTMLButtonElement>('.slider button[aria-label="Закрыть"]')?.click();
     },

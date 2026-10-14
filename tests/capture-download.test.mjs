@@ -57,6 +57,21 @@ test('cancellation suppresses a late original, then restores manual downloading'
   });
 });
 
+test('original URL timeout requests page recovery and still suppresses a late native download', async ({ mock }) => {
+  mock.timers.enable({ apis: ['setTimeout'] });
+  await withPage(() => {}, async (frame, doc) => {
+    const pending = captureDownloadUrl('/photounlim/video.MOV', 'video.MOV');
+    mock.timers.tick(30_000);
+    const result = await pending;
+    assert.equal(result.reloadRequired, true);
+    assert.match(result.error, /30 секунд/);
+    assert.equal((await captureDownloadUrl('/photounlim/video.MOV', 'video.MOV')).reloadRequired, true);
+    frame.src = original;
+    assert.deepEqual(frame.forwarded, []);
+    assert.equal(doc.documentElement.hasAttribute('data-ypvd-download-pending'), false);
+  });
+});
+
 test('captures a newly created download iframe and leaves unrelated iframe navigations alone', async () => {
   await withPage(frame => {
     const unrelated = new frame.constructor(); unrelated.id = 'docviewer'; unrelated.src = original;

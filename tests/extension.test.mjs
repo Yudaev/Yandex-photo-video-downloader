@@ -5,6 +5,7 @@ import { runInNewContext } from 'node:vm';
 import './photo-button.test.mjs';
 import './download-folder.test.mjs';
 import './download-modes.test.mjs';
+import './download-recovery.test.mjs';
 import './save-download.test.mjs';
 import './photo-viewer.test.mjs';
 import './capture-download.test.mjs';

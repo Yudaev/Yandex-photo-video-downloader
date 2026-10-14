@@ -99,6 +99,23 @@ function FolderPicker() {
     let currentName: string | undefined;
     let trace: unknown[] | undefined;
     let reportedError: unknown;
+    const processed = new Set<string>();
+    let account: string | undefined;
+    async function pause(ms: number) {
+      controller.signal.throwIfAborted();
+      await new Promise<void>((resolve, reject) => {
+        const abort = () => { clearTimeout(timer); reject(controller.signal.reason); };
+        const timer = setTimeout(() => { controller.signal.removeEventListener('abort', abort); resolve(); }, ms);
+        controller.signal.addEventListener('abort', abort, { once: true });
+      });
+      controller.signal.throwIfAborted();
+    }
+    async function waitForNetwork() {
+      while (!navigator.onLine) {
+        setProgress('Жду восстановления сети. Можно остановить скачивание.');
+        await pause(5000);
+      }
+    }
     async function diagnostic(action: string, fields: Record<string, unknown> = {}) {
       try {
         const result = await browser.runtime.sendMessage({ type: 'download-diagnostics', action, runId, tabId, name: currentName, ...fields });
@@ -142,10 +159,65 @@ function FolderPicker() {
           active.current = { tabId, controller };
           async function next(action: 'start' | 'next' | 'open', key?: string): Promise<DownloadItem | null> {
             controller.signal.throwIfAborted();
-            const result = await browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action, key, photos, videos });
-            if (result?.error) throw new Error(result.error);
-            if (!result || !('item' in result)) throw new Error('Обновите страницу Яндекс Диска после установки расширения.');
-            return result.item;
+            let pending = true;
+            let reading = false;
+            let waitingSince: number | undefined;
+            let reloadRequested = false;
+            const timer = setInterval(() => {
+              if (reading || controller.signal.aborted) return;
+              reading = true;
+              void browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action: 'diagnose' }).then(view => {
+                if (pending && !controller.signal.aborted && typeof view?.account === 'string' && /^\d+$/.test(view.account)) account ??= view.account;
+                if (pending && !controller.signal.aborted && view?.waitingForPhotos) {
+                  setProgress('Жду загрузки фотоленты. Можно остановить скачивание.');
+                  waitingSince ??= Date.now();
+                  if (!reloadRequested && Date.now() - waitingSince >= 180_000) {
+                    reloadRequested = true;
+                    void browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action: 'stop' }).catch(() => {});
+                  }
+                } else if (!view?.waitingForPhotos) {
+                  waitingSince = undefined;
+                }
+              }).catch(() => {}).finally(() => { reading = false; });
+            }, 1000);
+            try {
+              const result = await browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action, key, photos, videos,
+                ...(action === 'start' ? { account, visited: [...processed] } : {}) });
+              controller.signal.throwIfAborted();
+              if (reloadRequested) {
+                pending = false; clearInterval(timer);
+                return await recoverPage();
+              }
+              if (result?.error) throw new Error(result.error);
+              if (!result || !('item' in result)) throw new Error('Обновите страницу Яндекс Диска после установки расширения.');
+              return result.item;
+            } finally { pending = false; clearInterval(timer); }
+          }
+          async function recoverPage(): Promise<DownloadItem | null> {
+            await phase('page-recovery');
+            setProgress('Восстанавливаю страницу Яндекса через 30 секунд. Можно остановить скачивание.');
+            await pause(30_000);
+            await waitForNetwork();
+            const checkPage = (url?: string) => {
+              if (!/^https:\/\/disk\.yandex\.ru\/client\/photo\/?(?:[?#]|$)/.test(url ?? '')) {
+                throw new Error('Открыта другая страница. Вернитесь в раздел «Фото».');
+              }
+            };
+            checkPage((await browser.tabs.get(tabId!)).url);
+            controller.signal.throwIfAborted();
+            await browser.tabs.reload(tabId!);
+            setProgress('Жду обновления страницы Яндекса. Обработанные файлы будут пропущены.');
+            while (true) {
+              await pause(1000);
+              await waitForNetwork();
+              const tab = await browser.tabs.get(tabId!);
+              checkPage(tab.url);
+              if (tab.status !== 'complete') continue;
+              try { return await next('start'); }
+              catch (error) {
+                if (!/Receiving end does not exist|Could not establish connection|message port closed|back.forward cache/i.test(error instanceof Error ? error.message : String(error))) throw error;
+              }
+            }
           }
           async function remember(result: DownloadResult) {
             await setDownloadResult(result);
@@ -159,12 +231,15 @@ function FolderPicker() {
           let item = await next('start');
           while (item) {
             controller.signal.throwIfAborted();
+            await waitForNetwork();
+            if (account && item.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
+            account = item.account;
             currentName = item.name; trace = undefined;
             await phase('local-file-check');
             setProgress(item.name);
             if ((item.type === 'photo' && photos) || (item.type === 'video' && videos)) {
               let previous = await getDownloadResult(item.key);
-              if (!matchesDownloadStatus(previous?.status ?? metadata.find(item.key)?.status, mode)) {
+              if (processed.has(item.key) || !matchesDownloadStatus(previous?.status ?? metadata.find(item.key)?.status, mode)) {
                 await phase('traversal-next');
                 item = await next('next');
                 continue;
@@ -183,13 +258,16 @@ function FolderPicker() {
                 totals.skipped++;
               }
               else {
+                processed.add(item.key);
                 await remember({ ...item, status: 'saving', folder });
                 let successful: DownloadResult | undefined;
+                let reloadRequired = false;
                 try {
                   await phase('viewer-info');
                   const opened = item.id ? item : await next('open', item.key);
                   if (!opened) throw new Error('Не удалось открыть файл.');
                   item = opened;
+                  processed.add(item.key);
                   await remember({ ...item, status: 'saving', folder });
                   if (item.error) throw new Error(item.error);
                   setProgress(`${item.name} — получение адреса оригинала…`);
@@ -198,6 +276,7 @@ function FolderPicker() {
                     target: { tabId }, world: 'MAIN', func: captureDownloadUrl, args: [item.id, item.name],
                   });
                   const capture = injected[0]?.result;
+                  reloadRequired = capture?.reloadRequired === true;
                   trace = capture?.trace;
                   if (capture?.error) throw new Error(capture.error);
                   const url = capture?.url;
@@ -228,10 +307,16 @@ function FolderPicker() {
                   await remember({ ...item, status: 'error', folder, error: message });
                   totals.failed++;
                   setCounts({ ...totals });
-                  if (controller.signal.aborted || !navigator.onLine || /HTTP (429|401|403)|Обновите страницу перед повторным/.test(message)
+                  if (controller.signal.aborted || /HTTP (401|403)/.test(message)
                     || (error instanceof DOMException && ['NotAllowedError', 'SecurityError', 'QuotaExceededError', 'UnknownError'].includes(error.name))) throw error;
                   setStatus(`Не сохранён ${item.name}: ${message}`);
+                  if (/HTTP 429/.test(message)) {
+                    setProgress('Яндекс ограничил запросы. Жду 60 секунд перед продолжением.');
+                    await pause(60_000);
+                  }
+                  await waitForNetwork();
                 }
+                if (reloadRequired) { item = await recoverPage(); continue; }
                 if (successful) {
                   try { await phase('metadata-save'); await metadata.remember(successful); }
                   catch (error) {

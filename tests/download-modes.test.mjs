@@ -19,12 +19,18 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
     const history = new Map(items.slice(1, 4).map(item => [item.key, { ...item, status: item.key, folder }]));
     const before = [...history].map(([key, record]) => [key, { ...record }]);
     const writes = [];
+    const timers = new Set();
+    const progress = [];
     let index = 0;
     let counts;
+    let delayDiagnostic = false;
+    let finishDiagnostic;
     const context = {
       folder, photos: true, videos: true, os: 'linux',
       starting: { current: false }, active: { current: undefined },
       AbortController, DOMException, crypto, navigator: { onLine: true, locks: { async request(_name, _options, callback) { await callback({}); } } },
+      setInterval(callback) { timers.add(callback); return callback; },
+      clearInterval(callback) { timers.delete(callback); },
       matchesDownloadStatus,
       async getDownloadResult(key) { return history.get(key); },
       async setDownloadResult(result) { writes.push(result); history.set(result.key, result); },
@@ -41,14 +47,29 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
         tabs: {
           async query() { return [{ id: 17, url: 'https://disk.yandex.ru/client/photo' }]; },
           async sendMessage(_tab, { action }) {
-            if (action === 'start') return { item: items[index] };
-            if (action === 'next') return { item: items[++index] ?? null };
+            if (action === 'diagnose') {
+              if (delayDiagnostic) return new Promise(resolve => { finishDiagnostic = resolve; });
+              return { waitingForPhotos: true };
+            }
+            if (action === 'start') {
+              for (const callback of timers) callback();
+              await Promise.resolve();
+              return { item: items[index] };
+            }
+            if (action === 'next') {
+              if (index === items.length - 1) {
+                delayDiagnostic = true;
+                for (const callback of timers) callback();
+              }
+              return { item: items[++index] ?? null };
+            }
             return {};
           },
         },
       },
       setCounts(value) { counts = value; },
       ...Object.fromEntries(['setRunning', 'setStatus', 'setDatesReady', 'setCopyStatus', 'setProgress', 'setLogStatus'].map(name => [name, () => {}])),
+      setProgress(value) { progress.push(value); },
     };
     const download = runInNewContext(`${code}\nstartDownload`, context);
     await download(mode);
@@ -58,5 +79,10 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
     assert.equal(counts.failed, 1);
     assert.equal(index, items.length);
     assert.equal(context.starting.current, false);
+    assert.ok(progress.some(value => value.includes('Жду загрузки фотоленты')));
+    assert.equal(timers.size, 0);
+    finishDiagnostic({ waitingForPhotos: true });
+    await Promise.resolve();
+    assert.equal(progress.at(-1), '', 'late waiting diagnostics cannot replace completed progress');
   });
 }
