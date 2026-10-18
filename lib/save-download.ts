@@ -37,7 +37,7 @@ export async function saveDownload(
       onAbort = () => reject(transferSignal.reason);
       transferSignal.addEventListener('abort', onAbort, { once: true });
     });
-    const timer = setTimeout(() => request.abort(new Error('Яндекс не передаёт данные 30 секунд. Файл будет повторён при следующем запуске.')), 30_000);
+    const timer = setTimeout(() => request.abort(new Error('Яндекс не передаёт данные 30 секунд.')), 30_000);
     try { return await Promise.race([operation(), cancelled]); }
     finally { clearTimeout(timer); transferSignal.removeEventListener('abort', onAbort); }
   }

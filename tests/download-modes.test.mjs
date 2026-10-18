@@ -21,14 +21,17 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
     const writes = [];
     const timers = new Set();
     const progress = [];
-    let index = 0;
+    let index = 0; let starts = 0; const saved = new Map(); const statuses = [];
     let counts;
     let delayDiagnostic = false;
     let finishDiagnostic;
     const context = {
       folder, photos: true, videos: true, os: 'linux',
       starting: { current: false }, active: { current: undefined },
-      AbortController, DOMException, crypto, navigator: { onLine: true, locks: { async request(_name, _options, callback) { await callback({}); } } },
+      AbortController, DOMException, crypto, fetch,
+      setTimeout(callback) { queueMicrotask(callback); return 1; }, clearTimeout() {},
+      captureDownloadUrl() {}, async saveDownload(_folder, name) { return { savedName: name, bytes: 3 }; },
+      navigator: { onLine: true, locks: { async request(_name, _options, callback) { await callback({}); } } },
       setInterval(callback) { timers.add(callback); return callback; },
       clearInterval(callback) { timers.delete(callback); },
       matchesDownloadStatus,
@@ -37,13 +40,14 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
       async getSuccessfulDownloads() { return []; },
       async canReuseDownload() { return false; },
       async prepareDownloadMetadata() {
-        return { find(key) { return key === 'json' ? { ...items[4], status: 'success', folder } : undefined; } };
+        return { find(key) { return key === 'json' ? { ...items[4], status: 'success', folder } : saved.get(key); }, async remember(result) { saved.set(result.key, result); } };
       },
       createDiagnosticsFile() { return { name: 'log.json', async save() {} }; },
       diagnosticError(error) { return error.message; },
       browser: {
         runtime: { async sendMessage() { return { ok: true }; } },
         storage: { local: { async set() {} } },
+        scripting: { async executeScript() { return [{ result: { url: 'https://downloader.disk.yandex.ru/file' } }]; } },
         tabs: {
           async query() { return [{ id: 17, url: 'https://disk.yandex.ru/client/photo' }]; },
           async sendMessage(_tab, { action }) {
@@ -52,9 +56,12 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
               return { waitingForPhotos: true };
             }
             if (action === 'start') {
+              index = 0;
+              if (starts++) for (const item of items) delete item.error;
+              delayDiagnostic = false;
               for (const callback of timers) callback();
               await Promise.resolve();
-              return { item: items[index] };
+              return { item: items[index], position: { top: 1, month: '3-2022' } };
             }
             if (action === 'next') {
               if (index === items.length - 1) {
@@ -69,14 +76,16 @@ for (const [mode, expected] of [['error', ['error']], ['new', ['new']]]) {
       },
       setCounts(value) { counts = value; },
       ...Object.fromEntries(['setRunning', 'setStatus', 'setDatesReady', 'setCopyStatus', 'setProgress', 'setLogStatus'].map(name => [name, () => {}])),
-      setProgress(value) { progress.push(value); },
+      setProgress(value) { progress.push(value); }, setStatus(value) { statuses.push(value); },
     };
     const download = runInNewContext(`${code}\nstartDownload`, context);
     await download(mode);
     assert.deepEqual([...new Set(writes.map(result => result.key))], expected);
     assert.ok(writes.some(result => result.status === 'error'));
     for (const [key, record] of before) if (!expected.includes(key)) assert.deepEqual(history.get(key), record);
-    assert.equal(counts.failed, 1);
+    assert.equal(counts.failed, mode === 'error' ? 0 : 1);
+    assert.match(statuses.at(-1), /Фотолента обработана/);
+    if (mode === 'error') assert.equal(history.get('error').status, 'success');
     assert.equal(index, items.length);
     assert.equal(context.starting.current, false);
     assert.ok(progress.some(value => value.includes('Жду загрузки фотоленты')));

@@ -1,11 +1,12 @@
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import { test } from 'node:test';
+import { runInNewContext } from 'node:vm';
 import { transformWithOxc } from 'vite';
 import { parseHTML } from 'linkedom';
 
 const { code } = await transformWithOxc(readFileSync(new URL('../lib/photo-viewer.ts', import.meta.url), 'utf8'), 'photo-viewer.ts');
-const { readPhotoTiles, readPhotoInfo, showDownloadMark, createPhotoTraversal } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
+const { readPhotoTiles, readPhotoInfo, showDownloadMark, createPhotoTraversal, isPhotoPosition } = await import(`data:text/javascript;base64,${Buffer.from(code).toString('base64')}`);
 
 function fixture(account = '42') {
   return parseHTML(`<html><body><div class="photo__item photo__item_photounlim" title="video.MOV" aria-label="Видео video.MOV"><img src="//1.downloader.disk.yandex.ru/preview/hash/inf/token?uid=${account}" /></div>
@@ -198,7 +199,7 @@ test('recovery at the top changes scroll position to wake the virtual grid', asy
   traversal.stop();
 });
 
-test('falls back to the top when restoring the last visible position does not repair the grid', async ({ mock }) => {
+test('repeated recovery stays near the last working position instead of restarting the feed', async ({ mock }) => {
   let time = 0; mock.method(Date, 'now', () => time);
   const { traversal, doc, win } = traversalPage();
   const timer = win.setTimeout;
@@ -208,12 +209,14 @@ test('falls back to the top when restoring the last visible position does not re
   const scroll = doc.documentElement;
   const position = Object.getOwnPropertyDescriptor(scroll, 'scrollTop');
   for (const tile of doc.querySelectorAll('.photo__item')) tile.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
-  let returnsToTop = 0;
+  let nudges = 0;
+  const positions = [];
   Object.defineProperty(scroll, 'scrollTop', {
     get: position.get,
     set(value) {
       position.set(value);
-      if (value === 0 && ++returnsToTop === 2) {
+      positions.push(value);
+      if (value !== 300 && ++nudges === 2) {
         const tile = doc.querySelector('.photo__item').cloneNode(true);
         tile.title = 'recovered.HEIC';
         tile.getBoundingClientRect = () => ({ top: 10, bottom: 110 });
@@ -224,8 +227,291 @@ test('falls back to the top when restoring the last visible position does not re
   assert.equal((await traversal.next()).name, 'recovered.HEIC');
   assert.equal(traversal.diagnose().visited, 3);
   assert.equal(traversal.diagnose().scrollRecoveries, 2);
+  assert.ok(positions.every(top => top > 0), 'recovery must not send an old feed back to the beginning');
   assert.equal(await traversal.next(), null);
   traversal.stop();
+});
+
+function addTimeline({ doc, win }, onJump = () => {}) {
+  const timeline = doc.createElement('div');
+  timeline.className = 'desktop-fast-scroll__inner';
+  timeline.innerHTML = '<div class="desktop-fast-scroll__month" data-month="8-2026"></div><div class="desktop-fast-scroll__month" data-month="3-2022"></div><div class="desktop-fast-scroll__month" data-month="2-2022"></div><div class="desktop-fast-scroll__scroll-pointer"></div>';
+  doc.body.append(timeline);
+  timeline.getBoundingClientRect = () => ({ top: 100, bottom: 500, left: 900, width: 20, height: 400 });
+  const months = timeline.querySelectorAll('[data-month]');
+  [100, 300, 350].forEach((top, index) => { months[index].getBoundingClientRect = () => ({ top }); });
+  let pointerTop = 320;
+  timeline.querySelector('.desktop-fast-scroll__scroll-pointer').getBoundingClientRect = () => ({ top: pointerTop });
+  doc.defaultView.MouseEvent = class extends doc.defaultView.Event {
+    constructor(type, options) { super(type, options); Object.assign(this, options); }
+  };
+  win.dispatchEvent = event => doc.dispatchEvent(event);
+  const jumps = [];
+  timeline.addEventListener('mousedown', event => {
+    assert.equal(event.button, 0);
+    jumps.push(event.clientY);
+    pointerTop = event.clientY;
+    onJump();
+  });
+  return { timeline, jumps, setPointer(top) { pointerTop = top; } };
+}
+
+test('position validation rejects malformed checkpoints from extension messages', () => {
+  assert.equal(isPhotoPosition({ top: 900, month: '3-2022' }), true);
+  assert.equal(isPhotoPosition({ top: 0 }), true);
+  for (const value of [null, [], {}, { top: -1 }, { top: Infinity }, { top: '900' }, { top: 1, month: '12-2022' }, { top: 1, month: '<script>' }, { top: 1, anchor: 42 }, { top: 1, anchor: '' }, { top: 1, anchor: 'x'.repeat(4096) }]) {
+    assert.equal(isPhotoPosition(value), false);
+  }
+});
+
+test('resumes through the timeline before returning a file from the reloaded page', async () => {
+  const page = traversalPage();
+  const { traversal, doc } = page;
+  const { jumps } = addTimeline(page, () => {
+    const tile = doc.querySelector('.photo__item');
+    tile.title = 'april.HEIC';
+  });
+  const item = await traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } });
+  assert.equal(item.name, 'april.HEIC');
+  assert.equal(jumps.length, 1);
+  assert.ok(jumps[0] <= 300 && jumps[0] >= 299, 'land before the month boundary to avoid skipping its first files');
+  traversal.stop();
+});
+
+test('a timeline click ignored during page initialization is repeated before giving up', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  let clicks = 0;
+  const { jumps } = addTimeline(page, () => {
+    if (++clicks === 3) page.doc.querySelector('.photo__item').title = 'recovered.HEIC';
+  });
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  const item = await page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } });
+  assert.equal(item.name, 'recovered.HEIC');
+  assert.equal(jumps.length, 3);
+  page.traversal.stop();
+});
+
+test('an error retry can explicitly start at the top of the whole timeline', async () => {
+  const page = traversalPage();
+  page.doc.documentElement.scrollTop = 300;
+  const { jumps } = addTimeline(page, () => { page.doc.querySelector('.photo__item').title = 'newest.HEIC'; });
+  const item = await page.traversal.start({ photos: true, videos: true, position: { top: 0 } });
+  assert.equal(item.name, 'newest.HEIC');
+  assert.deepEqual(jumps, [100]);
+  page.traversal.stop();
+});
+
+test('starting at the top also works for a short feed without a timeline', async () => {
+  const page = traversalPage();
+  page.doc.documentElement.scrollTop = 300;
+  await page.traversal.start({ photos: true, videos: true, position: { top: 0 } });
+  assert.equal(page.doc.documentElement.scrollTop, 0);
+  page.traversal.stop();
+});
+
+test('a checkpoint without a month recovers by its scroll position and visible file, then adopts the restored timeline', async () => {
+  const original = traversalPage();
+  original.doc.documentElement.scrollTop = 300;
+  const first = await original.traversal.start();
+  const saved = original.traversal.diagnose().position;
+  assert.equal(saved.anchor, first.key);
+  original.traversal.stop();
+  const page = traversalPage();
+  addTimeline(page);
+  const resumed = await page.traversal.start({ photos: true, videos: true, account: '42', position: saved });
+  assert.equal(resumed.key, first.key);
+  assert.equal(page.doc.documentElement.scrollTop, 300);
+  assert.equal(page.traversal.diagnose().position.month, '3-2022');
+  page.traversal.stop();
+});
+
+test('scroll fallback waits for the grid height and reapplies a position initially clamped to zero', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  let top = 0; let height = 100;
+  const scroll = { clientHeight: 100, get scrollHeight() { return height; }, get scrollTop() { return top; }, set scrollTop(value) { top = Math.min(value, height - 100); } };
+  Object.defineProperty(page.doc, 'scrollingElement', { value: scroll });
+  const tile = page.doc.querySelector('.photo__item');
+  const anchor = readPhotoTiles(page.doc)[0].key;
+  tile.getBoundingClientRect = () => top === 300 ? { top: 10, bottom: 110 } : { top: -300, bottom: -200 };
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => { time += ms; if (time >= 1000) height = 500; callback(); }, 0);
+  const item = await page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 300, anchor } });
+  assert.equal(item.key, anchor);
+  assert.equal(scroll.scrollTop, 300);
+  page.traversal.stop();
+});
+
+test('a scroll fallback cannot resume on different thumbnails', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  await assert.rejects(page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 300, anchor: 'missing-file' } }), error => error.cause === 'page-recovery');
+  assert.equal(page.traversal.diagnose().visited, 0);
+});
+
+test('an empty grid returns through its saved month and keeps the checkpoint while waiting', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  const { traversal, doc, win } = page;
+  const tile = doc.querySelector('.photo__item');
+  let blank = false;
+  const { jumps } = addTimeline(page, () => { blank = false; tile.title = 'recovered.HEIC'; });
+  tile.getBoundingClientRect = () => blank ? { top: -300, bottom: -200 } : { top: 10, bottom: 110 };
+  const timer = win.setTimeout;
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; if (time > 100_000) traversal.stop(); callback(); }, 0);
+  await traversal.start();
+  const position = traversal.diagnose().position;
+  assert.equal(position.month, '3-2022');
+  blank = true;
+  assert.deepEqual(traversal.diagnose().position, position);
+  assert.equal((await traversal.next()).name, 'recovered.HEIC');
+  assert.equal(jumps.length, 1);
+  assert.equal(traversal.diagnose().scrollRecoveries, 1);
+  traversal.stop();
+});
+
+test('a missing timeline stops resumption instead of downloading from the beginning', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const { traversal, win, opened } = traversalPage();
+  const timer = win.setTimeout;
+  win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  await assert.rejects(traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } }), /таймлайн/i);
+  assert.deepEqual(opened, []);
+});
+
+test('a changed account cannot navigate the timeline during resumption', async () => {
+  const page = traversalPage();
+  const { jumps } = addTimeline(page);
+  await assert.rejects(page.traversal.start({ photos: true, videos: true, account: '43', position: { top: 90000, month: '3-2022' } }), /Аккаунт/);
+  assert.deepEqual(jumps, []);
+});
+
+test('a manual restart preserves the position chosen by the user on the timeline', async () => {
+  const { traversal, doc } = traversalPage();
+  doc.documentElement.scrollTop = 300;
+  await traversal.start();
+  assert.equal(doc.documentElement.scrollTop, 300);
+  traversal.stop();
+});
+
+test('a sparse timeline falls back to a newer month rather than skipping past the checkpoint', async () => {
+  const page = traversalPage();
+  const { timeline, jumps } = addTimeline(page, () => { page.doc.querySelector('.photo__item').title = 'older.HEIC'; });
+  timeline.querySelector('[data-month="3-2022"]').dataset.month = '4-2022';
+  await page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } });
+  assert.deepEqual(jumps, [299]);
+  page.traversal.stop();
+});
+
+test('moving the timeline pointer alone cannot resume while old thumbnails remain visible', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  addTimeline(page);
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, 0);
+  await assert.rejects(page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } }), /таймлайн/i);
+  assert.equal(page.traversal.diagnose().visited, 0);
+});
+
+test('stopping while waiting for a reloaded timeline prevents navigation and downloads', async () => {
+  const page = traversalPage();
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => { page.traversal.stop(); callback(); }, 0);
+  await assert.rejects(page.traversal.start({ photos: true, videos: true, account: '42', position: { top: 90000, month: '3-2022' } }), /остановлено/);
+  assert.equal(page.traversal.diagnose().visited, 0);
+  assert.deepEqual(page.opened, []);
+});
+
+test('the chosen month survives a feed that is empty from the start', async () => {
+  const page = traversalPage();
+  addTimeline(page);
+  page.doc.getElementById('tiles').replaceChildren();
+  const timer = page.win.setTimeout;
+  let saved;
+  page.win.setTimeout = (callback, ms) => timer(() => { saved = page.traversal.diagnose().position; page.traversal.stop(); callback(); }, 0);
+  await assert.rejects(page.traversal.start(), /остановлено/);
+  assert.equal(saved?.month, '3-2022');
+});
+
+test('failed timeline refreshes keep waiting so the panel can reload after three minutes', async ({ mock }) => {
+  let time = 0; mock.method(Date, 'now', () => time);
+  const page = traversalPage();
+  const tile = page.doc.querySelector('.photo__item');
+  const { jumps } = addTimeline(page);
+  await page.traversal.start();
+  tile.getBoundingClientRect = () => ({ top: -300, bottom: -200 });
+  const timer = page.win.setTimeout;
+  page.win.setTimeout = (callback, ms) => timer(() => {
+    time += ms;
+    if (time >= 181_000) page.traversal.stop();
+    callback();
+  }, 0);
+  await assert.rejects(page.traversal.next(), /остановлено/);
+  assert.ok(time >= 181_000);
+  assert.ok(jumps.length >= 2);
+  assert.equal(page.traversal.diagnose().position.month, '3-2022');
+});
+
+test('content messages validate incoming checkpoints and return the new checkpoint to the panel', async () => {
+  const source = readFileSync(new URL('../entrypoints/photo.content.ts', import.meta.url), 'utf8');
+  const { code } = await transformWithOxc(source.slice(source.indexOf('    const handleMessage ='), source.indexOf('    browser.runtime.onMessage')), 'photo-message.ts');
+  const calls = [];
+  const position = { top: 100, month: '3-2022' };
+  const handler = runInNewContext(`${code}\nhandleMessage`, {
+    browser: { runtime: { id: 'extension' } }, isPhotoPosition,
+    traversal: { async start(options) { calls.push(options); return { name: 'photo.HEIC' }; }, diagnose() { return { position }; } },
+  });
+  let response;
+  for (const input of [{ top: -1 }, { top: 100, month: '12-2022' }]) {
+    handler({ type: 'photo-traversal', action: 'start', account: '42', position: input }, { id: 'extension' }, result => { response = result; });
+    assert.match(response.error, /Некорректное/);
+  }
+  handler({ type: 'photo-traversal', action: 'start', position, visited: ['already-processed'] }, { id: 'extension' }, result => { response = result; });
+  assert.match(response.error, /Некорректное/);
+  assert.equal(calls.length, 0);
+  handler({ type: 'photo-traversal', action: 'start', account: '42', position }, { id: 'extension' }, result => { response = result; });
+  await Promise.resolve();
+  assert.equal(calls[0].position.month, '3-2022');
+  assert.equal(response.position.month, '3-2022');
+  assert.equal(response.item.name, 'photo.HEIC');
+  handler({ type: 'photo-traversal', action: 'start', visited: [], position }, { id: 'extension' }, result => { response = result; });
+  await Promise.resolve();
+  assert.equal(calls.length, 2);
+  assert.equal(response.item.name, 'photo.HEIC');
+});
+
+test('content messages distinguish recoverable traversal failures from account and cancellation errors', async () => {
+  const source = readFileSync(new URL('../entrypoints/photo.content.ts', import.meta.url), 'utf8');
+  const start = source.slice(source.indexOf('    const handleMessage ='), source.indexOf('    browser.runtime.onMessage.addListener'));
+  const { code } = await transformWithOxc(start, 'content-message.ts');
+  const position = { top: 90000, month: '3-2022' };
+  for (const cause of ['page-recovery', undefined]) {
+    const handler = runInNewContext(`${code}\nhandleMessage`, {
+      Error, browser: { runtime: { id: 'extension' } }, isPhotoPosition,
+      traversal: { async next() { throw new Error('Fixture error', { cause }); }, diagnose() { return { position, unresolvedCount: 1, unresolvedPosition: position }; } },
+    });
+    let response;
+    handler({ type: 'photo-traversal', action: 'next' }, { id: 'extension' }, result => { response = result; });
+    await Promise.resolve();
+    assert.equal(response.retryable, cause === 'page-recovery');
+    assert.equal(response.unresolvedCount, 1);
+    assert.deepEqual(response.unresolvedPosition, position);
+    assert.deepEqual(response.position, position);
+  }
+});
+
+test('an initially empty run can restore its month before the account was identified', async () => {
+  const page = traversalPage();
+  addTimeline(page, () => { page.doc.querySelector('.photo__item').title = 'april.HEIC'; });
+  const item = await page.traversal.start({ photos: true, videos: true, visited: [], position: { top: 90000, month: '3-2022' } });
+  assert.equal(item.name, 'april.HEIC');
+  assert.equal(item.account, '42');
+  page.traversal.stop();
+  await assert.rejects(page.traversal.start({ photos: true, videos: true, visited: ['already-processed'], position: { top: 90000, month: '3-2022' } }), /Некорректное/);
 });
 
 test('an account change with no visible tiles halts without recovery', async () => {
@@ -341,7 +627,9 @@ test('an ordinary file without preview no longer blocks known tiles and is ident
 
 test('an unidentifiable file is marked and reported after the rest of the feed, not at its position', async ({ mock }) => {
   let time = 0; mock.method(Date, 'now', () => time);
-  const { traversal, doc, win } = traversalPage();
+  const page = traversalPage();
+  const { traversal, doc, win } = page;
+  const { setPointer } = addTimeline(page);
   const timer = win.setTimeout;
   win.setTimeout = (callback, ms) => timer(() => { time += ms; callback(); }, ms);
   const unknown = doc.createElement('div'); unknown.className = 'photo__item'; unknown.title = 'broken.MOV';
@@ -350,7 +638,10 @@ test('an unidentifiable file is marked and reported after the rest of the feed, 
   doc.getElementById('tiles').append(unknown);
   assert.equal((await traversal.start()).name, 'first.HEIC');
   assert.equal((await traversal.next()).name, 'late.MOV');
-  await assert.rejects(traversal.next(), /Фотолента обработана, но не удалось определить 1 файлов/);
+  setPointer(360);
+  assert.equal(await traversal.next(), null);
+  assert.equal(traversal.diagnose().unresolvedCount, 1);
+  assert.equal(traversal.diagnose().unresolvedPosition.month, '3-2022', 'next pass must include the first unidentified file');
   assert.equal(unknown.querySelector('[data-ypvd-mark]').dataset.status, 'error');
   assert.equal(traversal.diagnose().unresolved[0].name, 'broken.MOV');
   traversal.stop();

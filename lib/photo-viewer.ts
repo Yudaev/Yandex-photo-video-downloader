@@ -2,6 +2,16 @@ import type { DownloadItem } from './download-folder';
 
 const resolvedTiles = new WeakMap<HTMLElement, { account: string; name: string; identity: string }>();
 
+export interface PhotoPosition { top: number; month?: string; anchor?: string }
+
+export function isPhotoPosition(value: unknown): value is PhotoPosition {
+  if (!value || typeof value !== 'object') return false;
+  const { top, month, anchor } = value as PhotoPosition;
+  return typeof top === 'number' && Number.isFinite(top) && top >= 0
+    && (month === undefined || (typeof month === 'string' && /^(?:[0-9]|1[01])-\d{4}$/.test(month)))
+    && (anchor === undefined || (typeof anchor === 'string' && anchor.length > 0 && anchor.length < 4096));
+}
+
 export function readPhotoTiles(doc: Document) {
   const elements = [...doc.querySelectorAll<HTMLElement>('.photo__item[title]')];
   let account = '';
@@ -52,19 +62,104 @@ export function createPhotoTraversal(doc: Document, win: Window) {
   let visited = new Set<string>();
   let account = '';
   const unresolved = new Map<HTMLElement, { name: string; error: string }>();
+  let unresolvedPosition: PhotoPosition | undefined;
   let stopped = true;
   let photos = true;
   let videos = true;
   let scroll: HTMLElement;
   let lastVisibleTop = 0;
+  let position: PhotoPosition | undefined;
   let scrollRecoveries = 0;
   let waitingForPhotos = false;
+  let restoringPosition = false;
+  let timelineTarget: number | undefined;
+  const timelineRestoreMessage = 'Не удалось вернуться к сохранённому месяцу по таймлайну.';
   let selected: ReturnType<typeof readPhotoTiles>[number] | undefined;
   const delay = (ms: number) => new Promise<void>((resolve) => win.setTimeout(resolve, ms));
   const ensurePage = () => {
     if (stopped) throw new Error('Скачивание остановлено.');
     if (!/^\/client\/photo\/?$/.test(win.location.pathname)) throw new Error('Открыта другая страница. Вернитесь в раздел «Фото».');
   };
+  const isVisible = (item: ReturnType<typeof readPhotoTiles>[number]) => {
+    const rect = item.element.getBoundingClientRect();
+    return rect.bottom > 0 && rect.top < win.innerHeight;
+  };
+  function checkedTiles() {
+    const items = readPhotoTiles(doc);
+    if (items.length) {
+      if (account && items[0]!.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
+      account = items[0]!.account;
+    }
+    return items;
+  }
+  function rememberPosition() {
+    const timeline = doc.querySelector('.desktop-fast-scroll__inner');
+    const pointer = timeline && timeline.getBoundingClientRect().height > 0 ? timeline.querySelector('.desktop-fast-scroll__scroll-pointer') : undefined;
+    const top = pointer?.getBoundingClientRect().top;
+    const marker = [...doc.querySelectorAll<HTMLElement>('.desktop-fast-scroll__month[data-month]')]
+      .filter(element => top !== undefined && element.getBoundingClientRect().top <= top)
+      .sort((a, b) => b.getBoundingClientRect().top - a.getBoundingClientRect().top)[0];
+    const month = marker?.dataset.month;
+    if (month && isPhotoPosition({ top: 0, month })) position = { top: scroll.scrollTop, month };
+    else if (!position?.month) position = { top: scroll.scrollTop, anchor: checkedTiles().find(tile => tile.key && isVisible(tile))?.key };
+  }
+  async function restorePosition(saved: PhotoPosition) {
+    waitingForPhotos = true;
+    restoringPosition = true;
+    try {
+      if (!saved.month) {
+        if (saved.anchor) {
+          scroll.scrollTop = saved.top;
+          let nextScroll = Date.now() + 1000;
+          await waitFor(() => {
+            if (checkedTiles().some(tile => tile.key === saved.anchor && isVisible(tile))) return true;
+            if (Date.now() >= nextScroll) { scroll.scrollTop = saved.top; nextScroll = Date.now() + 1000; }
+            return undefined;
+          }, timelineRestoreMessage);
+          lastVisibleTop = scroll.scrollTop;
+          rememberPosition();
+          return;
+        }
+        if (saved.top > 0) throw new Error('Не удалось сохранить месяц или файл на месте остановки. Выберите место на таймлайне и запустите снова.');
+        if (!doc.querySelector('.desktop-fast-scroll__inner')) { scroll.scrollTop = 0; await delay(500); return; }
+      }
+      const monthNumber = (month: string) => { const [m, y] = month.split('-').map(Number); return y! * 12 + m!; };
+      const { timeline, marker } = await waitFor(() => {
+        checkedTiles();
+        const timeline = doc.querySelector<HTMLElement>('.desktop-fast-scroll__inner');
+        if (!timeline || timeline.getBoundingClientRect().height <= 0) return undefined;
+        if (!saved.month) return { timeline, marker: timeline };
+        // Sparse timelines may omit a month; the nearest newer marker cannot skip unfinished files.
+        const marker = [...timeline.querySelectorAll<HTMLElement>('.desktop-fast-scroll__month[data-month]')]
+          .filter(element => isPhotoPosition({ top: 0, month: element.dataset.month }) && element.dataset.month
+            && monthNumber(element.dataset.month) >= monthNumber(saved.month!))
+          .sort((a, b) => monthNumber(a.dataset.month!) - monthNumber(b.dataset.month!))[0];
+        return marker ? { timeline, marker } : undefined;
+      }, timelineRestoreMessage);
+      const target = () => Math.max(timeline.getBoundingClientRect().top, marker.getBoundingClientRect().top - 1);
+      const before = checkedTiles().filter(isVisible).map(tile => tile.key || tile.name).join('\n');
+      const pointerTop = doc.querySelector('.desktop-fast-scroll__scroll-pointer')?.getBoundingClientRect().top;
+      const alreadyThere = pointerTop !== undefined && Math.abs(pointerTop - target()) <= 2;
+      const MouseEventType = doc.defaultView?.MouseEvent ?? MouseEvent;
+      let nextClick = 0;
+      await waitFor(() => {
+        const visible = checkedTiles().filter(isVisible);
+        const top = doc.querySelector('.desktop-fast-scroll__scroll-pointer')?.getBoundingClientRect().top;
+        const changed = visible.map(tile => tile.key || tile.name).join('\n') !== before;
+        if (visible.length && top !== undefined && Math.abs(top - target()) <= 2 && (alreadyThere || changed)) return true;
+        if (Date.now() >= nextClick) {
+          const rect = timeline.getBoundingClientRect();
+          timelineTarget = target();
+          const event = { bubbles: true, button: 0, clientX: rect.left + rect.width / 2, clientY: timelineTarget };
+          timeline.dispatchEvent(new MouseEventType('mousedown', { ...event, buttons: 1 }));
+          win.dispatchEvent(new MouseEventType('mouseup', { ...event, buttons: 0 }));
+          nextClick = Date.now() + 1000;
+        }
+        return undefined;
+      }, timelineRestoreMessage);
+      lastVisibleTop = scroll.scrollTop;
+    } finally { restoringPosition = false; }
+  }
   async function waitFor<T>(read: () => T | undefined, message: string): Promise<T> {
     const deadline = Date.now() + 30_000;
     do {
@@ -73,7 +168,7 @@ export function createPhotoTraversal(doc: Document, win: Window) {
       if (value !== undefined) return value;
       await delay(100);
     } while (Date.now() < deadline);
-    throw new Error(message);
+    throw new Error(message, { cause: 'page-recovery' });
   }
   async function close() {
     const button = doc.querySelector<HTMLButtonElement>('.slider button[aria-label="Закрыть"]');
@@ -86,39 +181,35 @@ export function createPhotoTraversal(doc: Document, win: Window) {
     selected = undefined;
     let bottom = 0;
     let previousHeight = 0;
-    let recoveryAttempts = 0;
     const emptyFeedMessage = 'Фотолента не загрузилась или в окне нет её элементов.';
     while (true) {
       let tiles: ReturnType<typeof readPhotoTiles>;
       try {
         tiles = await waitFor(() => {
-          const items = readPhotoTiles(doc);
+          const items = checkedTiles();
           if (!items.length) { waitingForPhotos = true; return undefined; }
-          if (account && items[0]!.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
-          account = items[0]!.account;
-          waitingForPhotos = !items.some(item => {
-            const rect = item.element.getBoundingClientRect();
-            return rect.bottom > 0 && rect.top < win.innerHeight;
-          });
+          waitingForPhotos = !items.some(isVisible);
           if (waitingForPhotos) return undefined;
           return items;
         }, emptyFeedMessage);
       } catch (error) {
         ensurePage();
         if (!(error instanceof Error) || error.message !== emptyFeedMessage) throw error;
-        recoveryAttempts++;
         scrollRecoveries++;
         bottom = 0; previousHeight = 0;
         scroll = (doc.scrollingElement ?? doc.documentElement) as HTMLElement;
-        // A virtual grid can keep stale tiles outside the viewport; force a new scroll position.
-        const restorePosition = recoveryAttempts % 2 === 1;
-        const nudgeFromTop = Math.min(100, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
-        scroll.scrollTop = restorePosition
-          ? lastVisibleTop > 0 ? Math.max(0, lastVisibleTop - scroll.clientHeight) : nudgeFromTop
-          : 0;
-        await delay(500);
-        ensurePage();
-        if (restorePosition) {
+        if (position?.month) {
+          try { await restorePosition(position); }
+          catch (error) {
+            ensurePage();
+            if (!(error instanceof Error) || error.message !== timelineRestoreMessage) throw error;
+          }
+        } else {
+          // Wake a stale virtual grid locally, without restarting the traversal from the top.
+          scroll.scrollTop = lastVisibleTop > 0 ? Math.max(1, lastVisibleTop - 100)
+            : Math.min(100, Math.max(0, scroll.scrollHeight - scroll.clientHeight));
+          await delay(500);
+          ensurePage();
           scroll.scrollTop = lastVisibleTop;
           await delay(500);
         }
@@ -126,6 +217,7 @@ export function createPhotoTraversal(doc: Document, win: Window) {
       }
       if (tiles[0]!.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
       lastVisibleTop = scroll.scrollTop;
+      if (!position?.month) rememberPosition();
       const tile = tiles.find(item => item.key && !visited.has(item.key));
       if (tile) {
         visited.add(tile.key);
@@ -140,6 +232,7 @@ export function createPhotoTraversal(doc: Document, win: Window) {
         const item = await open('');
         if (!item.error && item.key) { visited.add(item.key); return item; }
         const error = item.error ?? 'Не удалось определить файл по информации просмотрщика.';
+        unresolvedPosition ??= position;
         unresolved.set(unknown.element, { name: unknown.name, error });
         showDownloadMark(unknown.element, 'error', error);
         await close();
@@ -149,10 +242,11 @@ export function createPhotoTraversal(doc: Document, win: Window) {
       const atBottom = scroll.scrollTop + scroll.clientHeight >= height - 2;
       bottom = atBottom && height === previousHeight ? bottom + 1 : 0;
       if (bottom >= 3) {
-        if (unresolved.size) throw new Error(`Фотолента обработана, но не удалось определить ${unresolved.size} файлов. Подробности сохранены в журнале; повторите запуск для новой попытки.`);
         return null;
       }
       previousHeight = height;
+      // Advance the checkpoint only after every rendered candidate has been handled.
+      rememberPosition();
       scroll.scrollTop = Math.min(height, scroll.scrollTop + Math.max(100, scroll.clientHeight * .7));
       await delay(atBottom ? 1000 : 500);
       ensurePage();
@@ -191,31 +285,39 @@ export function createPhotoTraversal(doc: Document, win: Window) {
   }
 
   return {
-    async start(options: { photos: boolean; videos: boolean; account?: string; visited?: string[] } = { photos: true, videos: true }) {
+    async start(options: { photos: boolean; videos: boolean; account?: string; visited?: string[]; position?: PhotoPosition } = { photos: true, videos: true }) {
       if (!stopped) throw new Error('В этой вкладке уже идёт скачивание.');
+      if (options.position !== undefined && (!isPhotoPosition(options.position) || (!options.account && options.visited?.length))) throw new Error('Некорректное состояние восстановления фотоленты.');
       stopped = false;
       visited = new Set(options.visited ?? []);
       account = options.account ?? '';
       unresolved.clear();
+      unresolvedPosition = undefined;
       lastVisibleTop = 0;
+      position = options.position;
       scrollRecoveries = 0;
       waitingForPhotos = false;
+      restoringPosition = false;
+      timelineTarget = undefined;
       photos = options.photos;
       videos = options.videos;
       try {
         await close();
         scroll = (doc.scrollingElement ?? doc.documentElement) as HTMLElement;
-        scroll.scrollTop = 0;
+        lastVisibleTop = scroll.scrollTop;
+        if (position) await restorePosition(position);
+        else rememberPosition();
         return await next();
       } catch (error) { stopped = true; waitingForPhotos = false; throw error; }
     },
     next,
     diagnose() {
       const tiles = readPhotoTiles(doc);
-      return { time: new Date().toISOString(), route: win.location.pathname, account, stopped, visited: visited.size, scrollRecoveries, waitingForPhotos,
+      return { time: new Date().toISOString(), route: win.location.pathname, account, stopped, visited: visited.size, scrollRecoveries, waitingForPhotos, restoringPosition, position,
+        timeline: { target: timelineTarget, pointer: doc.querySelector('.desktop-fast-scroll__scroll-pointer')?.getBoundingClientRect().top },
         rendered: doc.querySelectorAll('.photo__item[title]').length, identified: tiles.filter(tile => tile.key).length,
         visible: tiles.filter(tile => { const rect = tile.element.getBoundingClientRect(); return rect.bottom > 0 && rect.top < win.innerHeight; }).length,
-        unresolved: [...unresolved.values()].slice(0, 50), unresolvedCount: unresolved.size,
+        unresolved: [...unresolved.values()].slice(0, 50), unresolvedCount: unresolved.size, unresolvedPosition,
         unidentified: tiles.filter(tile => !tile.key).slice(0, 10).map(tile => ({ name: tile.name, type: tile.type })),
         scroll: scroll && { top: scroll.scrollTop, height: scroll.scrollHeight, viewport: scroll.clientHeight },
         viewerOpen: !!doc.querySelector('.slider'), pendingDownload: doc.documentElement.hasAttribute('data-ypvd-download-pending') };

@@ -6,6 +6,7 @@ import { captureDownloadUrl } from '../../lib/capture-download';
 import { canReuseDownload, saveDownload } from '../../lib/save-download';
 import { prepareDownloadMetadata, dateInstructions } from '../../lib/download-metadata';
 import { diagnosticError, createDiagnosticsFile } from '../../lib/download-diagnostics';
+import type { PhotoPosition } from '../../lib/photo-viewer';
 import './style.css';
 
 declare global {
@@ -100,7 +101,22 @@ function FolderPicker() {
     let trace: unknown[] | undefined;
     let reportedError: unknown;
     const processed = new Set<string>();
+    const failed = new Map<string, PhotoPosition | undefined>();
     let account: string | undefined;
+    let position: PhotoPosition | undefined = mode === 'error' ? { top: 0 } : undefined;
+    let retryPosition: PhotoPosition | undefined;
+    let unresolvedCount = 0;
+    function rememberTraversal(view?: { account?: string; position?: PhotoPosition; unresolvedCount?: number; unresolvedPosition?: PhotoPosition }) {
+      if (!view || (view.account && account && view.account !== account)) return;
+      if (view.account && /^\d+$/.test(view.account)) account ??= view.account;
+      if (view.position) position = view.position;
+      if (view.unresolvedCount) {
+        unresolvedCount = Math.max(unresolvedCount, view.unresolvedCount);
+        retryPosition ??= view.unresolvedPosition;
+      }
+    }
+    const connectionLost = (error: unknown) => /Receiving end does not exist|Could not establish connection|message port closed|back.forward cache/i.test(error instanceof Error ? error.message : String(error));
+    const recoverable = (error: unknown) => connectionLost(error) || (error instanceof Error && error.cause === 'page-recovery');
     async function pause(ms: number) {
       controller.signal.throwIfAborted();
       await new Promise<void>((resolve, reject) => {
@@ -157,7 +173,7 @@ function FolderPicker() {
           }
           tabId = tab.id;
           active.current = { tabId, controller };
-          async function next(action: 'start' | 'next' | 'open', key?: string): Promise<DownloadItem | null> {
+          async function readTraversal(action: 'start' | 'next' | 'open', key?: string): Promise<DownloadItem | null> {
             controller.signal.throwIfAborted();
             let pending = true;
             let reading = false;
@@ -167,9 +183,10 @@ function FolderPicker() {
               if (reading || controller.signal.aborted) return;
               reading = true;
               void browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action: 'diagnose' }).then(view => {
-                if (pending && !controller.signal.aborted && typeof view?.account === 'string' && /^\d+$/.test(view.account)) account ??= view.account;
+                if (pending && !controller.signal.aborted) rememberTraversal(view);
                 if (pending && !controller.signal.aborted && view?.waitingForPhotos) {
-                  setProgress('Жду загрузки фотоленты. Можно остановить скачивание.');
+                  setProgress(view.restoringPosition ? 'Возвращаюсь к месту остановки по таймлайну. Можно остановить скачивание.'
+                    : 'Жду загрузки фотоленты. Можно остановить скачивание.');
                   waitingSince ??= Date.now();
                   if (!reloadRequested && Date.now() - waitingSince >= 180_000) {
                     reloadRequested = true;
@@ -182,40 +199,59 @@ function FolderPicker() {
             }, 1000);
             try {
               const result = await browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action, key, photos, videos,
-                ...(action === 'start' ? { account, visited: [...processed] } : {}) });
+                ...(action === 'start' ? { account, visited: [...processed], position } : {}) });
               controller.signal.throwIfAborted();
+              rememberTraversal(result);
               if (reloadRequested) {
-                pending = false; clearInterval(timer);
-                return await recoverPage();
+                throw new Error('Фотолента не загрузилась за три минуты.', { cause: 'page-recovery' });
               }
-              if (result?.error) throw new Error(result.error);
+              if (result?.error) throw new Error(result.error, { cause: result.retryable ? 'page-recovery' : undefined });
               if (!result || !('item' in result)) throw new Error('Обновите страницу Яндекс Диска после установки расширения.');
               return result.item;
             } finally { pending = false; clearInterval(timer); }
           }
+          async function next(action: 'start' | 'next' | 'open', key?: string): Promise<DownloadItem | null> {
+            try { return await readTraversal(action, key); }
+            catch (error) {
+              if (controller.signal.aborted || action === 'open' || !recoverable(error)) throw error;
+              await failure(error);
+              return await recoverPage();
+            }
+          }
           async function recoverPage(): Promise<DownloadItem | null> {
-            await phase('page-recovery');
-            setProgress('Восстанавливаю страницу Яндекса через 30 секунд. Можно остановить скачивание.');
-            await pause(30_000);
-            await waitForNetwork();
+            const view = await browser.tabs.sendMessage(tabId!, { type: 'photo-traversal', action: 'diagnose' }).catch(() => undefined);
+            if (view?.account && account && view.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
+            rememberTraversal(view);
+            if (!position && processed.size) throw new Error('Не удалось сохранить место остановки. Вернитесь к нему по таймлайну и повторите запуск.');
             const checkPage = (url?: string) => {
               if (!/^https:\/\/disk\.yandex\.ru\/client\/photo\/?(?:[?#]|$)/.test(url ?? '')) {
                 throw new Error('Открыта другая страница. Вернитесь в раздел «Фото».');
               }
             };
-            checkPage((await browser.tabs.get(tabId!)).url);
-            controller.signal.throwIfAborted();
-            await browser.tabs.reload(tabId!);
-            setProgress('Жду обновления страницы Яндекса. Обработанные файлы будут пропущены.');
             while (true) {
-              await pause(1000);
+              await phase('page-recovery');
+              setProgress('Восстанавливаю страницу Яндекса через 30 секунд. Можно остановить скачивание.');
+              await pause(30_000);
               await waitForNetwork();
-              const tab = await browser.tabs.get(tabId!);
-              checkPage(tab.url);
-              if (tab.status !== 'complete') continue;
-              try { return await next('start'); }
-              catch (error) {
-                if (!/Receiving end does not exist|Could not establish connection|message port closed|back.forward cache/i.test(error instanceof Error ? error.message : String(error))) throw error;
+              checkPage((await browser.tabs.get(tabId!)).url);
+              controller.signal.throwIfAborted();
+              await browser.tabs.reload(tabId!);
+              setProgress(position?.month ? 'Жду обновления страницы, затем вернусь к месту остановки по таймлайну.'
+                : 'Жду обновления страницы Яндекса. Обработанные файлы будут пропущены.');
+              const deadline = Date.now() + 180_000;
+              while (Date.now() < deadline) {
+                await pause(1000);
+                await waitForNetwork();
+                const tab = await browser.tabs.get(tabId!);
+                checkPage(tab.url);
+                if (tab.status !== 'complete') continue;
+                try { return await readTraversal('start'); }
+                catch (error) {
+                  if (controller.signal.aborted || !recoverable(error)) throw error;
+                  if (connectionLost(error)) continue;
+                  await failure(error);
+                  break;
+                }
               }
             }
           }
@@ -229,7 +265,22 @@ function FolderPicker() {
           setDatesReady(true);
           await phase('traversal-start');
           let item = await next('start');
-          while (item) {
+          while (true) {
+            if (!item) {
+              if (!unresolvedCount && (mode !== 'error' || !failed.size)) break;
+              if (unresolvedCount) await failure(new Error(`Не удалось определить ${unresolvedCount} файлов. Повторю в следующем проходе.`));
+              await phase('retry-wait');
+              setProgress(`Осталось повторить файлов: ${(mode === 'error' ? failed.size : 0) + unresolvedCount}. Повторю через 60 секунд. Можно остановить скачивание.`);
+              await pause(60_000);
+              await waitForNetwork();
+              await browser.tabs.sendMessage(tabId, { type: 'photo-traversal', action: 'stop' }).catch(() => {});
+              position = retryPosition ?? failed.values().next().value;
+              retryPosition = undefined;
+              unresolvedCount = 0;
+              if (mode === 'error') for (const key of failed.keys()) processed.delete(key);
+              item = await next('start');
+              continue;
+            }
             controller.signal.throwIfAborted();
             await waitForNetwork();
             if (account && item.account !== account) throw new Error('Аккаунт Яндекса изменился. Скачивание остановлено.');
@@ -256,6 +307,7 @@ function FolderPicker() {
                   await remember(metadata.find(item.key)!);
                 }
                 totals.skipped++;
+                failed.delete(item.key);
               }
               else {
                 processed.add(item.key);
@@ -299,17 +351,21 @@ function FolderPicker() {
                   await phase('history-save');
                   successful = { ...item, ...saved, status: 'success', folder };
                   await remember(successful);
+                  failed.delete(item.key);
                   if (saved.reused) totals.skipped++;
                   else totals.saved++;
                 } catch (error) {
                   if (!controller.signal.aborted) await failure(error);
                   const message = controller.signal.aborted ? 'Скачивание остановлено.' : error instanceof Error ? error.message : 'Не удалось сохранить файл.';
                   await remember({ ...item, status: 'error', folder, error: message });
-                  totals.failed++;
+                  if (!failed.has(item.key)) failed.set(item.key, position);
+                  if (mode === 'error') retryPosition ??= position;
+                  totals.failed = failed.size;
                   setCounts({ ...totals });
                   if (controller.signal.aborted || /HTTP (401|403)/.test(message)
                     || (error instanceof DOMException && ['NotAllowedError', 'SecurityError', 'QuotaExceededError', 'UnknownError'].includes(error.name))) throw error;
                   setStatus(`Не сохранён ${item.name}: ${message}`);
+                  reloadRequired ||= recoverable(error);
                   if (/HTTP 429/.test(message)) {
                     setProgress('Яндекс ограничил запросы. Жду 60 секунд перед продолжением.');
                     await pause(60_000);
@@ -327,6 +383,7 @@ function FolderPicker() {
                 }
               }
             }
+            totals.failed = failed.size;
             setCounts({ ...totals });
             await phase('traversal-next');
             item = await next('next');
@@ -397,7 +454,8 @@ function FolderPicker() {
           <button type="button" disabled={!folder || busy || loading || (!photos && !videos)} onClick={() => startDownload('new')}>Скачать файлы без статуса</button>
         </div>}
       <p className="hint">Во время скачивания оставьте вкладку и панель открытыми. Закрытие панели останавливает загрузку. Существующие файлы не перезаписываются.</p>
-      <p className="hint">«Повторить файлы с ошибкой» скачивает только файлы с крестиком. «Скачать файлы без статуса» скачивает только файлы без результата в истории или JSON. Успешные файлы пропускаются в обоих режимах, даже при смене папки. Прерванные загрузки после открытия панели считаются ошибками.</p>
+      <p className="hint">«Скачать файлы без статуса» идёт с текущего участка до конца ленты. Для всей коллекции сначала перейдите к новым фото вверху таймлайна. После сбоя страницы расширение возвращается к сохранённому месяцу и повторяет восстановление, пока лента не загрузится.</p>
+      <p className="hint">«Повторить файлы с ошибкой» проверяет всю ленту и скачивает только файлы с крестиком. Оставшиеся ошибки повторяются проходами с паузой 60 секунд, пока все эти файлы не сохранятся или вы не остановите процесс. Успешные файлы пропускаются в обоих режимах, даже при смене папки. Прерванные загрузки после открытия панели считаются ошибками.</p>
       <p className="hint">Имя и даты Яндекса сохраняются в истории и в yandex-downloads.json рядом с файлами. Время Яндекса трактуется в часовом поясе браузера; JSON также хранит даты в UTC.</p>
       <section aria-label="Диагностика">
         <h2>Диагностика</h2>

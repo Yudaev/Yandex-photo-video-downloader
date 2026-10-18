@@ -1,7 +1,7 @@
 import { defineContentScript } from 'wxt/utils/define-content-script';
 import { browser } from 'wxt/browser';
 import { syncPhotoButton } from '../lib/photo-button';
-import { createPhotoTraversal, readPhotoTiles, showDownloadMark } from '../lib/photo-viewer';
+import { createPhotoTraversal, isPhotoPosition, readPhotoTiles, showDownloadMark, type PhotoPosition } from '../lib/photo-viewer';
 
 export default defineContentScript({
   matches: ['https://disk.yandex.ru/client/*'],
@@ -11,20 +11,29 @@ export default defineContentScript({
     let revision = 0;
     const marks = new Map<string, { status?: 'saving' | 'success' | 'error'; text: string }>();
     const traversal = createPhotoTraversal(document, window);
-    const handleMessage = (message: { type?: string; action?: string; key?: string; photos?: boolean; videos?: boolean; account?: string; visited?: string[] }, sender: { id?: string }, sendResponse: (value: unknown) => void) => {
+    const handleMessage = (message: { type?: string; action?: string; key?: string; photos?: boolean; videos?: boolean; account?: string; visited?: string[]; position?: PhotoPosition }, sender: { id?: string }, sendResponse: (value: unknown) => void) => {
       if (sender.id !== browser.runtime.id || message?.type !== 'photo-traversal') return;
       if (message.action === 'diagnose') { sendResponse(traversal.diagnose()); return; }
       if (message.action === 'stop') { traversal.stop(); sendResponse({ ok: true }); return; }
       if (message.action === 'start' && ((message.account !== undefined && !/^\d+$/.test(message.account))
+        || (message.position !== undefined && (!isPhotoPosition(message.position) || (!message.account && message.visited?.length)))
         || (message.visited !== undefined && (!Array.isArray(message.visited) || !message.visited.every(key => typeof key === 'string' && key.length < 4096))))) {
         sendResponse({ error: 'Некорректное состояние восстановления фотоленты.' }); return;
       }
       const operation = message.action === 'start'
-        ? () => traversal.start({ photos: message.photos !== false, videos: message.videos !== false, account: message.account, visited: message.visited })
+        ? () => traversal.start({ photos: message.photos !== false, videos: message.videos !== false, account: message.account, visited: message.visited, position: message.position })
         : message.action === 'next' ? traversal.next
         : message.action === 'open' && typeof message.key === 'string' ? () => traversal.open(message.key!) : undefined;
       if (!operation) return;
-      operation().then(item => sendResponse({ item }), error => sendResponse({ error: error instanceof Error ? error.message : 'Ошибка фотоленты.' }));
+      operation().then(item => {
+        const { position, unresolvedCount, unresolvedPosition } = traversal.diagnose();
+        sendResponse({ item, position, unresolvedCount, unresolvedPosition });
+      },
+        error => {
+          const { position, unresolvedCount, unresolvedPosition } = traversal.diagnose();
+          sendResponse({ error: error instanceof Error ? error.message : 'Ошибка фотоленты.',
+            retryable: error instanceof Error && error.cause === 'page-recovery', position, unresolvedCount, unresolvedPosition });
+        });
       return true;
     };
     browser.runtime.onMessage.addListener(handleMessage);
